@@ -12,7 +12,7 @@ Interact with Microsoft Todo using the CLI script at `scripts/todograph.py`.
 
 ## Prerequisites
 
-1. **Config file** — create `~/.cursor/skills/todograph/.env`:
+1. **Config file** — create `~/todograph/.env`:
    ```
    CLIENT_ID=your_azure_app_client_id
    TENANT_ID=consumers
@@ -22,7 +22,7 @@ Interact with Microsoft Todo using the CLI script at `scripts/todograph.py`.
 
 2. **First run** triggers device-code auth. The script prints a URL + code:
    - Visit the URL, enter the code, sign in.
-   - Token is cached at `~/.cursor/skills/todograph/.token_cache.json` — subsequent runs are silent.
+   - Token is cached at `~/todograph/.token_cache.json` — subsequent runs are silent.
 
 ## Commands
 
@@ -43,7 +43,7 @@ All commands output clean JSON to **stdout**. Auth prompts go to **stderr** only
 | `delete <list_id> <task_id>` | Delete a task |
 
 ```bash
-python ~/.cursor/skills/todograph/scripts/todograph.py <command> [args...]
+python ~/todograph/scripts/todograph.py <command> [args...]
 ```
 
 ## Authentication Flow for Agents
@@ -64,7 +64,7 @@ Token is cached after first login — most runs need no auth at all.
 
 To authenticate proactively before running other commands:
 ```bash
-python ~/.cursor/skills/todograph/scripts/todograph.py auth
+python ~/todograph/scripts/todograph.py auth
 ```
 Returns `{"authenticated": true}` on success.
 
@@ -86,4 +86,4 @@ If `CLIENT_ID` is not configured, guide the user:
 3. Copy the **Application (client) ID**
 4. **API permissions** → Add → Microsoft Graph → Delegated → `Tasks.ReadWrite`
 5. **Authentication (Preview)** → Advanced settings → **Allow public client flows** → Yes → Save
-6. Paste the ID into `~/.cursor/skills/todograph/.env` as `CLIENT_ID`
+6. Paste the ID into `~/todograph/.env` as `CLIENT_ID`
