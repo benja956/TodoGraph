@@ -4,6 +4,8 @@ todograph — Microsoft Todo CLI, standard library only, no third-party dependen
 
 Usage:
   python todograph.py auth
+  python todograph.py auth-start
+  python todograph.py auth-poll [max_wait_seconds]
   python todograph.py lists
   python todograph.py tasks <list_id>
   python todograph.py create-list <name>
@@ -17,6 +19,7 @@ Usage:
 
 All output is JSON printed to stdout.
 Auth token is cached in ~/todograph/.token_cache.json
+Pending device flow is cached in ~/todograph/.device_flow.json
 Requires CLIENT_ID in ~/todograph/.env (or env var)
 """
 
@@ -37,6 +40,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).parent.parent
 ENV_FILE = SKILL_DIR / ".env"
 TOKEN_CACHE_FILE = SKILL_DIR / ".token_cache.json"
+DEVICE_FLOW_FILE = SKILL_DIR / ".device_flow.json"
 
 # Graph API 的根地址。单独提取为常量的原因：
 # 如果微软以后更换版本（v1.0 → v2.0），只需改这一处，不用全文搜索替换。
@@ -145,6 +149,30 @@ def _save_cache(data: dict):
         pass  # Windows does not support POSIX permissions
 
 
+def _load_device_flow() -> dict:
+    if DEVICE_FLOW_FILE.exists():
+        try:
+            return json.loads(DEVICE_FLOW_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_device_flow(data: dict):
+    DEVICE_FLOW_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        DEVICE_FLOW_FILE.chmod(0o600)
+    except NotImplementedError:
+        pass  # Windows does not support POSIX permissions
+
+
+def _clear_device_flow():
+    try:
+        DEVICE_FLOW_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _token_endpoint(tenant_id: str) -> str:
     # tenant_id 决定了登录的账户类型：
     # "consumers" → 个人微软账户（outlook.com、hotmail.com 等）
@@ -168,66 +196,145 @@ def _try_refresh(client_id: str, tenant_id: str, refresh_token: str) -> dict | N
     return result if "access_token" in result else None
 
 
-def _device_flow(client_id: str, tenant_id: str) -> dict:
-    # Device Code Flow（设备码流程）是专为"没有浏览器的环境"设计的 OAuth 登录方式。
-    # 适合 CLI 工具、服务器脚本、AI Agent 等场景。
-    # 流程：脚本先向微软申请一个短期验证码 → 打印给用户 → 用户在浏览器完成登录
-    # → 脚本轮询微软直到登录完成。
+def _start_device_flow(client_id: str, tenant_id: str) -> dict:
+    # 两段式认证的第一步：只申请 device code，并把中间状态落盘后立即返回。
+    # 这样 Agent 可以先把链接/验证码发给用户，而不是被阻塞在同一个进程里等待。
     url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode"
     flow = _request("POST", url, form={"client_id": client_id, "scope": SCOPE})
     if "error" in flow:
         _die(f"Device flow error: {flow.get('error_description', flow['error'])}")
 
-    # verification_uri_complete 是微软返回的带验证码的完整链接，用户点击即可自动填入验证码。
-    # 如果微软没有返回该字段（极少数情况），则退回到手动输入方式。
-    # 用 .get() 而不是直接访问 flow["verification_uri_complete"]，是为了防止字段不存在时报 KeyError。
+    now = int(time.time())
     url_complete = flow.get("verification_uri_complete", "")
-    print(json.dumps({
+    pending = {
+        "client_id": client_id,
+        "tenant_id": tenant_id,
+        "device_code": flow["device_code"],
+        "user_code": flow["user_code"],
+        "verification_uri": flow["verification_uri"],
+        "url_complete": url_complete,
+        "interval": int(flow.get("interval", 5)),
+        "expires_in": int(flow.get("expires_in", 900)),
+        "requested_at": now,
+        "expires_at": now + int(flow.get("expires_in", 900)),
+    }
+    _save_device_flow(pending)
+
+    return {
         "auth_required": True,
+        "started": True,
+        "pending": True,
+        "next_step": "Run auth-poll after the user completes authorization. Do not run auth or auth-start again.",
         "url": flow["verification_uri"],
         "url_complete": url_complete,
         "code": flow["user_code"],
-    }), file=sys.stderr, flush=True)
-    # flush=True：强制立即把内容写出去，不等缓冲区满。
-    # 在 Agent 调用场景下，如果不 flush，信息可能要等脚本结束才输出，Agent 就看不到提示。
+        "interval": pending["interval"],
+        "expires_in": pending["expires_in"],
+        "expires_at": pending["expires_at"],
+    }
 
-    interval = int(flow.get("interval", 5))   # 微软建议的轮询间隔秒数，默认5秒
-    deadline = time.time() + int(flow.get("expires_in", 900))  # 验证码的有效期，默认15分钟
+
+def _poll_device_flow(client_id: str, tenant_id: str, max_wait_seconds: int = 15) -> dict:
+    # 第二步：读取之前保存的 device_code，做有限时间轮询。
+    # 这样每次命令都能在短时间内结束，适合有超时限制的 exec 环境。
+    pending = _load_device_flow()
+    if not pending:
+        return {
+            "authenticated": False,
+            "pending": False,
+            "error": "NO_PENDING_AUTH",
+        }
+
+    if pending.get("client_id") != client_id or pending.get("tenant_id") != tenant_id:
+        _clear_device_flow()
+        return {
+            "authenticated": False,
+            "pending": False,
+            "error": "PENDING_AUTH_MISMATCH",
+        }
+
+    if int(time.time()) >= int(pending.get("expires_at", 0)):
+        _clear_device_flow()
+        return {
+            "authenticated": False,
+            "expired": True,
+        }
+
+    interval = max(1, int(pending.get("interval", 5)))
+    deadline = time.time() + max(1, max_wait_seconds)
 
     while time.time() < deadline:
-        time.sleep(interval)
         result = _request("POST", _token_endpoint(tenant_id), form={
             "client_id": client_id,
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "device_code": flow["device_code"],
+            "device_code": pending["device_code"],
         })
         if "access_token" in result:
-            return result
+            cache = {
+                "access_token": result["access_token"],
+                "refresh_token": result.get("refresh_token", ""),
+                "client_id": client_id,
+                "tenant_id": tenant_id,
+            }
+            _save_cache(cache)
+            _clear_device_flow()
+            return {"authenticated": True}
         err = result.get("error", "")
         if err == "authorization_pending":
-            # 用户还没完成登录，继续等待，这是正常状态
-            continue
+            if time.time() + interval > deadline:
+                break
+            time.sleep(interval)
         elif err == "slow_down":
-            # 微软要求降低轮询频率，每次增加5秒间隔
             interval += 5
+            pending["interval"] = interval
+            _save_device_flow(pending)
+            if time.time() + interval > deadline:
+                break
+            time.sleep(interval)
+        elif err == "expired_token":
+            _clear_device_flow()
+            return {
+                "authenticated": False,
+                "expired": True,
+            }
+        elif err in {"authorization_declined", "bad_verification_code"}:
+            _clear_device_flow()
+            return {
+                "authenticated": False,
+                "failed": True,
+                "error": err,
+                "message": result.get("error_description", err),
+            }
         else:
-            # 其他错误（如 access_denied：用户主动取消登录）
-            _die(f"Auth failed: {result.get('error_description', err)}")
+            return {
+                "authenticated": False,
+                "failed": True,
+                "error": err or "AUTH_POLL_FAILED",
+                "message": result.get("error_description", err or "Authentication failed"),
+            }
 
-    _die("Authentication timed out")
+    return {
+        "authenticated": False,
+        "pending": True,
+        "interval": interval,
+        "expires_at": pending.get("expires_at"),
+    }
 
 
-def _get_token() -> str:
+def _get_auth_config() -> tuple[str, str]:
     # 这是认证的总入口，对外只暴露这一个函数。
-    # 内部按优先级处理：先尝试静默刷新 → 失败则触发设备码登录。
-    # 调用方（各个 cmd_ 函数）不需要知道认证细节，只需要拿到 token 字符串。
-    # 这种"把复杂性隐藏在内部"的做法，在有协作的项目里很重要：
-    # 修改认证逻辑时不会影响到使用 token 的代码。
     _load_env()
     client_id = os.environ.get("CLIENT_ID")
     tenant_id = os.environ.get("TENANT_ID", "consumers")
     if not client_id:
         _die("CLIENT_ID not set. Add it to ~/todograph/.env")
+    return client_id, tenant_id
+
+
+def _get_token() -> str | None:
+    # 现在 _get_token 只负责“静默拿 token”：读取缓存并尝试 refresh。
+    # 如果做不到静默认证，就返回 None，让上层命令显式走 auth-start / auth-poll。
+    client_id, tenant_id = _get_auth_config()
 
     cache = _load_cache()
 
@@ -244,16 +351,7 @@ def _get_token() -> str:
             _save_cache(cache)
             return cache["access_token"]
 
-    # 静默刷新失败（或首次运行），进入设备码登录流程
-    result = _device_flow(client_id, tenant_id)
-    cache = {
-        "access_token": result["access_token"],
-        "refresh_token": result.get("refresh_token", ""),
-        "client_id": client_id,
-        "tenant_id": tenant_id,
-    }
-    _save_cache(cache)
-    return cache["access_token"]
+    return None
 
 
 # ── Graph API wrappers ────────────────────────────────────────────────────────
@@ -373,19 +471,35 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    # 所有命令都需要先获取 token，所以在解析命令之前统一获取。
-    # 唯一例外是 "auth" 命令本身——但 _get_token() 在 auth 命令下也会正常执行，
-    # 所以这里不需要特殊处理，统一走一遍认证流程即可。
-    token = _get_token()
     cmd = args[0]
+
+    if cmd in {"auth", "auth-start"}:
+        client_id, tenant_id = _get_auth_config()
+        print(json.dumps(_start_device_flow(client_id, tenant_id), ensure_ascii=False, indent=2))
+        return
+
+    if cmd == "auth-poll":
+        client_id, tenant_id = _get_auth_config()
+        max_wait_seconds = int(args[1]) if len(args) >= 2 else 15
+        print(json.dumps(_poll_device_flow(client_id, tenant_id, max_wait_seconds), ensure_ascii=False, indent=2))
+        return
+
+    # 业务命令只允许使用“已存在或可静默刷新”的 token。
+    # 如果当前必须重新授权，就直接返回可机器识别的 JSON，让 Agent 进入两段式授权流程。
+    token = _get_token()
+    if not token:
+        print(json.dumps({
+            "error": "AUTH_REQUIRED",
+            "auth_required": True,
+            "next_step": "Run auth-start, then auth-poll after the user completes authorization.",
+        }, ensure_ascii=False, indent=2))
+        return
 
     # 命令分发：根据命令名和参数数量，调用对应的 cmd_ 函数。
     # 同时检查参数数量（如 len(args) >= 2），避免因参数不足导致后续 args[1] 报 IndexError。
     # 工程上这种模式叫"命令路由"，大型项目通常用 argparse 库或 click 框架来做，
     # 但本脚本刻意只用标准库，所以手写 if/elif 链。
-    if cmd == "auth":
-        print(json.dumps({"authenticated": True}))
-    elif cmd == "create-list" and len(args) >= 2:
+    if cmd == "create-list" and len(args) >= 2:
         cmd_create_list(token, args[1])
     elif cmd == "rename-list" and len(args) >= 3:
         cmd_rename_list(token, args[1], args[2])
