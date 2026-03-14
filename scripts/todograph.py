@@ -16,11 +16,12 @@ Usage:
   python todograph.py update  <list_id> <task_id> <new_title>
 
 All output is JSON printed to stdout.
-Auth token is cached in ~/.cursor/skills/todograph/.token_cache.json
-Requires CLIENT_ID in ~/.cursor/skills/todograph/.env (or env var)
+Auth token is cached in ~/todograph/.token_cache.json
+Requires CLIENT_ID in ~/todograph/.env (or env var)
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -40,6 +41,7 @@ SCOPE = "Tasks.ReadWrite offline_access"
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _load_env():
+    """Load env vars from .env file. Priority: existing env vars > .env file."""
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -66,15 +68,17 @@ def _request(method: str, url: str, headers: dict = None, form: dict = None, bod
 
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         raw = e.read()
         try:
             return json.loads(raw)
-        except Exception:
-            _die(f"HTTP {e.code}: {raw.decode(errors='replace')}")
+        except json.JSONDecodeError:
+            _die(f"HTTP {e.code}: invalid JSON response: {raw.decode(errors='replace')}")
+        except UnicodeDecodeError:
+            _die(f"HTTP {e.code}: response encoding error")
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -90,6 +94,10 @@ def _load_cache() -> dict:
 
 def _save_cache(data: dict):
     TOKEN_CACHE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        TOKEN_CACHE_FILE.chmod(0o600)
+    except NotImplementedError:
+        pass  # Windows does not support POSIX permissions
 
 
 def _token_endpoint(tenant_id: str) -> str:
@@ -150,7 +158,7 @@ def _get_token() -> str:
     client_id = os.environ.get("CLIENT_ID")
     tenant_id = os.environ.get("TENANT_ID", "consumers")
     if not client_id:
-        _die("CLIENT_ID not set. Add it to ~/.cursor/skills/todograph/.env")
+        _die("CLIENT_ID not set. Add it to ~/todograph/.env")
 
     cache = _load_cache()
 
@@ -232,10 +240,16 @@ def cmd_tasks(token, list_id):
     print(json.dumps(data.get("value", []), ensure_ascii=False, indent=2))
 
 
+def _validate_date(date_str: str) -> str:
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        _die(f"Invalid date format: '{date_str}'. Use YYYY-MM-DD")
+    return date_str
+
+
 def cmd_create(token, list_id, title, due_date=None):
     body = {"title": title}
     if due_date:
-        body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
+        body["dueDateTime"] = {"dateTime": f"{_validate_date(due_date)}T00:00:00", "timeZone": "UTC"}
     print(json.dumps(_post(token, f"/me/todo/lists/{list_id}/tasks", body), ensure_ascii=False, indent=2))
 
 
