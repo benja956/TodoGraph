@@ -1,0 +1,24 @@
+# IDE
+.idea/
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+
+# Env
+.env
+
+# Token cache
+.token_cache.json
+
+# Personal prompt
+系统级提示词.txt
+
+# Git dir (optional)
+.git/
